@@ -11,6 +11,7 @@ import random
 from player import MusicPlayer
 from ir_config import IRConfig, ACOES
 from external_player import ExternalPlayer, MODOS
+from extension_api import ExtensionManager
 
 # ══════════════════════════════════════════
 #  Paleta
@@ -75,7 +76,7 @@ class TelaModo(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("🎧 Arduino Player")
-        self.geometry("480x420")
+        self.geometry("580x520")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.resultado = None
@@ -297,9 +298,9 @@ class App(tk.Tk):
         if modo == "externo":
             titulo += f"  [{self.ext.nome}]"
         self.title(titulo)
-        self.geometry("520x700")
+        self.geometry("620x800")
         self.configure(bg=BG)
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._fechar)
 
         # Estado lista
@@ -308,6 +309,10 @@ class App(tk.Tk):
         self._tab_ativa = tk.StringVar(value="playlist")
 
         self._build_ui()
+        # ── Extensões ───────────────────────────────
+        self._ext_manager = ExtensionManager(self, self._ext_widget_frame)
+        self._ext_manager.set_log_widget(self._ext_log_lbl)
+        self._carregar_extensoes_salvas()
         self.after(500, self._loop_ui)
 
         if self.arduino:
@@ -431,6 +436,18 @@ class App(tk.Tk):
             self._build_tabs()
         else:
             self._build_info_externo()
+
+        # ── Painel de extensões ─────────────────
+        # Cria placeholders antes do ExtensionManager ser instanciado
+        self._ext_widget_frame = tk.Frame(self, bg=BG)
+        self._ext_log_lbl = tk.Label(self, text="", bg=BG, fg=TEXT2,
+                                     font=("Courier", 7))
+        self._build_painel_extensoes(self)
+
+        # ── Toast (rodapé) ───────────────────────
+        self._toast_lbl = tk.Label(self, text="", bg=BG, fg=GREEN,
+                                   font=("Segoe UI", 8), pady=2)
+        self._toast_lbl.pack(fill="x", padx=16, pady=(0, 4))
 
     def _cbtn(self, p, txt, cmd, large=False, cor=BG3):
         return tk.Button(p, text=txt, bg=cor, fg=TEXT, relief="flat",
@@ -717,6 +734,14 @@ class App(tk.Tk):
             # Autopass: avança se terminou
             if p.autopass and p.terminou():
                 p.proxima()
+            # Emite musica_mudou se índice mudou
+            if not hasattr(self, '_ultimo_index'):
+                self._ultimo_index = -1
+            if p.musicas and p.index != self._ultimo_index:
+                self._ultimo_index = p.index
+                if hasattr(self, '_ext_manager'):
+                    self._ext_manager.emitir('musica_mudou',
+                        {'nome': p.musica_atual(), 'index': p.index})
 
         else:
             self.lbl_musica.config(text=self.ext.musica_atual())
@@ -775,6 +800,8 @@ class App(tk.Tk):
 
     def _fechar(self, reiniciar=False):
         self._vivo = False          # para todas as callbacks after/thread
+        if hasattr(self, '_ext_manager'):
+            self._ext_manager.descarregar_todas()
         if self.modo_tipo == "local" and self.player:
             self.player.destruir()  # para o pygame corretamente
         if self.arduino:
@@ -794,17 +821,26 @@ class App(tk.Tk):
             try:
                 if self.arduino and self.arduino.in_waiting:
                     linha = self.arduino.readline().decode(errors="ignore").strip()
-                    print("Arduino:", linha)
+                    #print("Arduino:", linha)
+                    # Emite evento para extensões
+                    if hasattr(self, '_ext_manager'):
+                        self._ext_manager.emitir('serial_linha', {'linha': linha})
                     if linha.startswith("POT:"):
                         val = int(linha.split(":")[1])
                         pct = int((val / 1023) * 100)
                         self.after(0, lambda p=pct: self._set_volume_ext(p))
+                        if hasattr(self, '_ext_manager'):
+                            self._ext_manager.emitir('volume_mudou', {'pct': pct})
                     elif linha.startswith("IR:"):
                         cod = linha.split(":", 1)[1].strip()
                         if self._captura_cb:
                             cb = self._captura_cb; self._captura_cb = None
                             self.after(0, lambda c=cod: cb(c))
                         else:
+                            acao = self.ir_config.resolver(cod)
+                            if hasattr(self, '_ext_manager'):
+                                self._ext_manager.emitir('ir_recebido',
+                                    {'codigo': cod, 'acao': acao})
                             self.after(0, lambda c=cod: self._processar_ir(c))
                 time.sleep(0.02)
             except Exception as e:
@@ -824,6 +860,174 @@ class App(tk.Tk):
         elif acao == "RECOMENDA":  self._tocar_recomendada()
         elif acao == "VOL_UP":     self._set_volume_ext(min(100, vol + 10))
         elif acao == "VOL_DOWN":   self._set_volume_ext(max(0,   vol - 10))
+
+
+    # ─────────────────────────────────────────
+    # 🧩 Extensões — painel na UI
+    # ─────────────────────────────────────────
+    def _build_painel_extensoes(self, parent):
+        outer = tk.Frame(parent, bg=BG, padx=16)
+        outer.pack(fill="x", pady=(4, 0))
+        hdr = tk.Frame(outer, bg=BG2, highlightthickness=1, highlightbackground=BORDER)
+        hdr.pack(fill="x")
+        self._ext_aberto = tk.BooleanVar(value=False)
+
+        def toggle():
+            if self._ext_aberto.get():
+                body.pack_forget(); self._ext_aberto.set(False)
+                btn_toggle.config(text="▶ Extensões")
+            else:
+                body.pack(fill="both"); self._ext_aberto.set(True)
+                btn_toggle.config(text="▼ Extensões")
+
+        btn_toggle = tk.Button(hdr, text="▶ Extensões", bg=BG2, fg=TEXT2,
+                               relief="flat", font=("Segoe UI", 8, "bold"),
+                               padx=10, pady=4, cursor="hand2", command=toggle)
+        btn_toggle.pack(side="left")
+        tk.Button(hdr, text="⚙ Gerenciar", bg=BG2, fg=ACC2, relief="flat",
+                  font=("Segoe UI", 8), cursor="hand2",
+                  command=self._abrir_painel_extensoes).pack(side="right", padx=6)
+
+        body = tk.Frame(outer, bg=BG3, highlightthickness=1, highlightbackground=BORDER)
+        self._ext_widget_frame = tk.Frame(body, bg=BG3)
+        self._ext_widget_frame.pack(fill="x", padx=8, pady=4)
+        self._ext_log_lbl = tk.Label(body, text="", bg=BG3, fg=TEXT2,
+                                     font=("Courier", 7), justify="left",
+                                     anchor="w", wraplength=470)
+        self._ext_log_lbl.pack(fill="x", padx=8, pady=(0, 6))
+
+    def _abrir_painel_extensoes(self):
+        JanelExtensoes(self, self._ext_manager)
+
+    def _carregar_extensoes_salvas(self):
+        cfg   = _ler_config()
+        ativas = cfg.get("extensoes_ativas", [])
+        for arq in ativas:
+            if os.path.exists(os.path.join("extensions", arq)):
+                self._ext_manager.carregar(arq)
+
+    def _salvar_extensoes_ativas(self):
+        _salvar_config({"extensoes_ativas": list(self._ext_manager._loaded.keys())})
+
+    def _mostrar_toast(self, msg: str, cor: str = "#22c55e", ms: int = 3000):
+        if not self._vivo:
+            return
+        try:
+            self._toast_lbl.config(text=msg, fg=cor)
+            if hasattr(self, "_toast_after"):
+                try: self.after_cancel(self._toast_after)
+                except Exception: pass
+            self._toast_after = self.after(ms, lambda: self._toast_lbl.config(text=""))
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════
+#  Janela de gerenciamento de extensões
+# ══════════════════════════════════════════
+class JanelExtensoes(tk.Toplevel):
+    def __init__(self, parent, manager):
+        super().__init__(parent)
+        self.manager = manager
+        self.parent  = parent
+        self.title("🧩 Extensões")
+        self.geometry("560x520")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self._build()
+        self._refresh()
+
+    def _build(self):
+        tk.Label(self, text="🧩 Extensões instaladas",
+                 bg=BG, fg=TEXT, font=("Segoe UI", 13, "bold")).pack(pady=(16, 2))
+        tk.Label(self, text="Pasta: extensions/  •  Adicione arquivos .py aqui",
+                 bg=BG, fg=TEXT2, font=("Segoe UI", 8)).pack(pady=(0, 10))
+
+        lf = tk.Frame(self, bg=BG3, highlightthickness=1, highlightbackground=BORDER)
+        lf.pack(fill="both", expand=True, padx=16)
+        cols = ("Arquivo", "Nome", "Versão", "Status")
+        self.tree = ttk.Treeview(lf, columns=cols, show="headings",
+                                 selectmode="browse", height=10)
+        for c, w in zip(cols, (140, 160, 60, 80)):
+            self.tree.heading(c, text=c); self.tree.column(c, width=w, anchor="w")
+        s = ttk.Style()
+        s.configure("Treeview", background=BG3, foreground=TEXT,
+                    fieldbackground=BG3, rowheight=26, font=("Segoe UI", 9))
+        s.configure("Treeview.Heading", background=BG2, foreground=ACC2,
+                    font=("Segoe UI", 9, "bold"))
+        s.map("Treeview", background=[("selected", ACCENT)])
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        btns = tk.Frame(self, bg=BG, pady=8)
+        btns.pack(fill="x", padx=16)
+        for txt, cor, cmd in [
+            ("✅ Ligar",      GREEN, self._ligar),
+            ("🔴 Desligar",  RED,   self._desligar),
+            ("🔄 Hot-reload", GOLD,  self._reload),
+        ]:
+            tk.Button(btns, text=txt, bg=cor, fg=TEXT, relief="flat",
+                      font=("Segoe UI", 9, "bold"), padx=10, pady=5,
+                      cursor="hand2", command=cmd).pack(side="left", padx=(0, 4))
+        tk.Button(btns, text="🔃 Atualizar", bg=BG3, fg=TEXT2, relief="flat",
+                  font=("Segoe UI", 9), padx=10, pady=5, cursor="hand2",
+                  command=self._refresh).pack(side="right")
+
+        log_f = tk.Frame(self, bg=BG2, highlightthickness=1, highlightbackground=BORDER)
+        log_f.pack(fill="x", padx=16, pady=(0, 12))
+        tk.Label(log_f, text="Log:", bg=BG2, fg=TEXT2,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=6, pady=(4, 0))
+        self._log_lbl = tk.Label(log_f, text="", bg=BG2, fg=GREEN,
+                                 font=("Courier", 7), justify="left",
+                                 anchor="w", wraplength=520)
+        self._log_lbl.pack(fill="x", padx=6, pady=(0, 6))
+        self.manager.set_log_widget(self._log_lbl)
+        self._loop_log()
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        for info in self.manager.descobrir():
+            status = "✅ ON" if info["carregado"] else "⭕ OFF"
+            self.tree.insert("", "end", iid=info["arquivo"],
+                             values=(info["arquivo"], info["nome"],
+                                     info["versao"], status))
+
+    def _selecionado(self):
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def _ligar(self):
+        arq = self._selecionado()
+        if arq:
+            self.manager.carregar(arq)
+            self.parent._salvar_extensoes_ativas()
+            self._refresh()
+
+    def _desligar(self):
+        arq = self._selecionado()
+        if arq:
+            self.manager.descarregar(arq)
+            self.parent._salvar_extensoes_ativas()
+            self._refresh()
+
+    def _reload(self):
+        arq = self._selecionado()
+        if arq:
+            self.manager.hot_reload(arq)
+            self.parent._salvar_extensoes_ativas()
+            self._refresh()
+
+    def _loop_log(self):
+        if not self.winfo_exists():
+            return
+        try:
+            self._log_lbl.config(text="\n".join(self.manager._log_lines[-8:]))
+        except Exception:
+            pass
+        self.after(800, self._loop_log)
+
 
 
 # ══════════════════════════════════════════
