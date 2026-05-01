@@ -12,6 +12,7 @@ from player import MusicPlayer
 from ir_config import IRConfig, ACOES
 from external_player import ExternalPlayer, MODOS
 from extension_api import ExtensionManager
+from tray import TrayManager, HAS_PYSTRAY
 
 # ══════════════════════════════════════════
 #  Paleta
@@ -76,10 +77,15 @@ class TelaModo(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("🎧 Arduino Player")
-        self.geometry("580x520")
+        self.geometry("480x420")
         self.configure(bg=BG)
         self.resizable(False, False)
         self.resultado = None
+        # Centraliza na tela
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        self.geometry(f"480x420+{(sw-480)//2}+{(sh-420)//2}")
         self._build()
 
     def _build(self):
@@ -259,6 +265,7 @@ class App(tk.Tk):
         self.ir_config  = IRConfig(CONFIG_PATH)
         self._captura_cb = None
         self._vivo      = True   # flag para threads saberem que a janela existe
+        self._ir_ativo  = False  # True enquanto processa IR → suprime foco
 
         # Carregar preferências salvas
         cfg = _ler_config()
@@ -298,10 +305,13 @@ class App(tk.Tk):
         if modo == "externo":
             titulo += f"  [{self.ext.nome}]"
         self.title(titulo)
-        self.geometry("620x800")
+        self.geometry("520x700")
         self.configure(bg=BG)
-        self.resizable(True, True)
+        self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self._fechar)
+
+        # Impede que a janela roube foco ao receber comandos IR
+        self._aplicar_noactivate()
 
         # Estado lista
         self._lista_cache: list[str] = []
@@ -313,7 +323,12 @@ class App(tk.Tk):
         self._ext_manager = ExtensionManager(self, self._ext_widget_frame)
         self._ext_manager.set_log_widget(self._ext_log_lbl)
         self._carregar_extensoes_salvas()
+        self.after(200, self._aplicar_noactivate)  # janela já visível
         self.after(500, self._loop_ui)
+        # ── Tray (bandeja do sistema) ────────────
+        self._tray = TrayManager(self, "Arduino Player")
+        # Atualiza tooltip do tray com música atual a cada 2s
+        self.after(2000, self._atualizar_tray)
 
         if self.arduino:
             threading.Thread(target=self._loop_serial, daemon=True).start()
@@ -731,8 +746,8 @@ class App(tk.Tk):
             self._atualizar_progresso()
             self._sincronizar_lista()
 
-            # Autopass: avança se terminou
-            if p.autopass and p.terminou():
+            # Autopass: usa evento pygame — detecção precisa, sem polling
+            if p.autopass and p.checar_fim():
                 p.proxima()
             # Emite musica_mudou se índice mudou
             if not hasattr(self, '_ultimo_index'):
@@ -795,11 +810,35 @@ class App(tk.Tk):
     # ─────────────────────────────────────────
     # ↩ Trocar modo / Fechar
     # ─────────────────────────────────────────
+    def _atualizar_tray(self):
+        """Atualiza tooltip da bandeja com música atual."""
+        if not self._vivo:
+            return
+        if hasattr(self, "_tray") and self._tray:
+            if self.modo_tipo == "local" and self.player:
+                txt = f"\U0001f3b5 {self.player.musica_atual()}"
+            elif self.ext:
+                txt = f"{self.ext.icone} {self.ext.nome}"
+            else:
+                txt = "Arduino Player"
+            self._tray.atualizar_tooltip(txt)
+        self.after(2000, self._atualizar_tray)
+
+    def _cmd_bg_proxima(self):
+        self._cmd_bg(self._cmd_proxima)
+
+    def _cmd_bg_anterior(self):
+        self._cmd_bg(self._cmd_anterior)
+
     def _trocar_modo(self):
+        if hasattr(self, '_tray'):
+            self._tray.parar()
         self._fechar(reiniciar=True)
 
     def _fechar(self, reiniciar=False):
         self._vivo = False          # para todas as callbacks after/thread
+        if hasattr(self, '_tray'):
+            self._tray.parar()
         if hasattr(self, '_ext_manager'):
             self._ext_manager.descarregar_todas()
         if self.modo_tipo == "local" and self.player:
@@ -821,7 +860,7 @@ class App(tk.Tk):
             try:
                 if self.arduino and self.arduino.in_waiting:
                     linha = self.arduino.readline().decode(errors="ignore").strip()
-                    #print("Arduino:", linha)
+                    print("Arduino:", linha)
                     # Emite evento para extensões
                     if hasattr(self, '_ext_manager'):
                         self._ext_manager.emitir('serial_linha', {'linha': linha})
@@ -848,18 +887,171 @@ class App(tk.Tk):
                     print("Erro serial:", e)
                 break
 
+    def _aplicar_noactivate(self):
+        """
+        Aplica WS_EX_NOACTIVATE na janela via ctypes.
+        Isso faz o Windows nunca ativar esta janela ao receber
+        eventos programáticos — equivalente ao que overlays de jogo fazem.
+        Chamado uma vez após a janela ser criada.
+        """
+        try:
+            import ctypes
+            import ctypes.wintypes
+
+            GWL_EXSTYLE      = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_APPWINDOW  = 0x00040000
+
+            hwnd = ctypes.windll.user32.FindWindowW(None, self.title())
+            if not hwnd:
+                # Fallback: pega HWND via Tk
+                hwnd = int(self.frame(), 16)
+
+            estilo_atual = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            # Adiciona NOACTIVATE, mantém o resto
+            novo_estilo = (estilo_atual | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, novo_estilo)
+            print("✅ WS_EX_NOACTIVATE aplicado — janela não rouba foco")
+        except Exception as e:
+            print(f"⚠️  _aplicar_noactivate: {e}")
+
+    def _cmd_bg(self, fn):
+        """
+        Executa fn() na thread principal via after(0) sem ativar a janela.
+        Usa SetWindowPos com SWP_NOACTIVATE logo antes para garantir
+        que o processamento do evento não acione SetForegroundWindow.
+        """
+        def _run():
+            if not self._vivo:
+                return
+            try:
+                # Reafirma NOACTIVATE antes de qualquer operação
+                import ctypes
+                SWP_NOACTIVATE  = 0x0010
+                SWP_NOMOVE      = 0x0002
+                SWP_NOSIZE      = 0x0001
+                SWP_NOZORDER    = 0x0004
+                flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                hwnd = int(self.frame(), 16)
+                ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags)
+            except Exception:
+                pass
+            try:
+                fn()
+            except Exception as e:
+                print(f"[cmd_bg] {e}")
+        self.after(0, _run)
+
     def _processar_ir(self, cod):
+        """
+        Processa comando IR completamente em background.
+        Aciona o player/volume diretamente sem chamar métodos que
+        criam eventos Tkinter — isso evita que o Windows traga
+        a janela do app para frente (WM_SETFOREGROUND).
+        """
         if not self._vivo:
             return
         acao = self.ir_config.resolver(cod)
-        vol  = self._get_vol_pct()
-        if   acao == "PLAY_PAUSE": self._cmd_play()
-        elif acao == "NEXT":       self._cmd_proxima()
-        elif acao == "PREV":       self._cmd_anterior()
-        elif acao == "SHUFFLE":    self._toggle_shuffle()
-        elif acao == "RECOMENDA":  self._tocar_recomendada()
-        elif acao == "VOL_UP":     self._set_volume_ext(min(100, vol + 10))
-        elif acao == "VOL_DOWN":   self._set_volume_ext(max(0,   vol - 10))
+        if not acao:
+            return
+
+        # Executa em thread separada para não bloquear a serial
+        threading.Thread(
+            target=self._executar_acao_ir,
+            args=(acao,),
+            daemon=True
+        ).start()
+
+    def _executar_acao_ir(self, acao: str):
+        """
+        Roda na thread IR.
+        Usa _cmd_bg() para voltar à thread principal do pygame/Tkinter
+        com WS_EX_NOACTIVATE + SWP_NOACTIVATE garantidos —
+        a janela processa o comando sem ganhar foco.
+        """
+        if not self._vivo:
+            return
+
+        if acao == "PLAY_PAUSE":
+            if self.modo_tipo == "local" and self.player:
+                self._cmd_bg(self.player.continuar)
+            elif self.ext:
+                self.ext.continuar()   # SendInput — ok fora da thread principal
+
+        elif acao == "NEXT":
+            if self.modo_tipo == "local" and self.player:
+                self._cmd_bg(self.player.proxima)
+            elif self.ext:
+                self.ext.proxima()
+
+        elif acao == "PREV":
+            if self.modo_tipo == "local" and self.player:
+                self._cmd_bg(self.player.anterior)
+            elif self.ext:
+                self.ext.anterior()
+
+        elif acao == "SHUFFLE":
+            if self.modo_tipo == "local" and self.player:
+                def _do_shuffle():
+                    ativo = self.player.toggle_shuffle()
+                    self._atualizar_btn_shuffle(ativo)
+                self._cmd_bg(_do_shuffle)
+
+        elif acao == "RECOMENDA":
+            if self.modo_tipo == "local" and self.player:
+                import random
+                def _do_rec():
+                    idxs = self.player.recomendadas(5)
+                    if idxs:
+                        self.player.tocar_indice(random.choice(idxs))
+                self._cmd_bg(_do_rec)
+
+        elif acao == "VOL_UP":
+            vol  = self._get_vol_pct()
+            novo = min(100, vol + 10)
+            if self.modo_tipo == "local" and self.player:
+                self._cmd_bg(lambda v=novo: (
+                    self.player.set_volume(v / 100),
+                    self._atualizar_slider_silencioso(v)
+                ))
+            elif self.ext:
+                self.ext.set_volume(novo)
+                self._cmd_bg(lambda v=novo: self._atualizar_slider_silencioso(v))
+
+        elif acao == "VOL_DOWN":
+            vol  = self._get_vol_pct()
+            novo = max(0, vol - 10)
+            if self.modo_tipo == "local" and self.player:
+                self._cmd_bg(lambda v=novo: (
+                    self.player.set_volume(v / 100),
+                    self._atualizar_slider_silencioso(v)
+                ))
+            elif self.ext:
+                self.ext.set_volume(novo)
+                self._cmd_bg(lambda v=novo: self._atualizar_slider_silencioso(v))
+
+    def _atualizar_btn_shuffle(self, ativo: bool):
+        """Atualiza visual do botão shuffle sem trazer a janela para frente."""
+        if not self._vivo:
+            return
+        try:
+            self.btn_shuffle.config(
+                bg=ACCENT if ativo else BG3,
+                fg=TEXT   if ativo else TEXT2,
+                text="🔀 Aleatório ON" if ativo else "🔀 Aleatório"
+            )
+        except tk.TclError:
+            pass
+
+    def _atualizar_slider_silencioso(self, pct: int):
+        """Atualiza slider e label de volume sem trazer a janela para frente."""
+        if not self._vivo:
+            return
+        try:
+            self.slider_vol.set(pct)
+            self.lbl_volume.config(text=f"{pct}%")
+        except tk.TclError:
+            pass
 
 
     # ─────────────────────────────────────────
@@ -1027,7 +1219,6 @@ class JanelExtensoes(tk.Toplevel):
         except Exception:
             pass
         self.after(800, self._loop_log)
-
 
 
 # ══════════════════════════════════════════

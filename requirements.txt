@@ -1,0 +1,9 @@
+pyserial
+pygame
+pystray
+tkinter
+time
+json
+os
+random
+

@@ -5,38 +5,52 @@ import json
 import time
 from collections import defaultdict
 
+# Evento customizado que o pygame dispara quando a música termina
+_MUSIC_END = pygame.USEREVENT + 1
+
 
 class MusicPlayer:
     def __init__(self, pasta="downloads", config_path="config.json"):
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+        pygame.init()  # necessário para o sistema de eventos
 
-        self.pasta       = pasta
-        self.config_path = config_path
-        self.musicas     = self.carregar_musicas()
-        self.index       = 0
-        self.volume      = 0.5
-        self.velocidade  = 1.0          # 0.5 – 2.0
+        # Registra evento de fim de música — pygame chama isso sozinho
+        pygame.mixer.music.set_endevent(_MUSIC_END)
+
+        self.pasta        = pasta
+        self.config_path  = config_path
+        self.musicas      = self.carregar_musicas()
+        self.index        = 0
+        self.volume       = 0.5
+        self.velocidade   = 1.0
         self.modo_shuffle = False
-        self.fila_shuffle = []
-        self.autoplay    = True         # inicia tocando
-        self.autopass    = True         # avança ao acabar
+        self.fila_shuffle: list[int] = []
+        self.autoplay     = True
+        self.autopass     = True
 
         # Rastreamento de posição
-        self._inicio_toque  = 0.0      # time.time() quando play() foi chamado
-        self._pos_pausada   = 0.0      # acumulado em segundos antes da pausa
-        self._pausado       = False
-        self._duracao_cache: dict[str, float] = {}  # nome → segundos
+        self._inicio_toque = 0.0
+        self._pos_pausada  = 0.0
+        self._pausado      = False
 
-        # Histórico / estatísticas
-        self.historico: list[int]         = []
+        # Histórico separado de "o que o usuário ouviu" —
+        # NÃO misturado com as estatísticas de contagem
+        # Cada entrada é o index que estava tocando ANTES de avançar.
+        # Assim anterior() sempre sabe para onde voltar.
+        self._historico_nav: list[int] = []   # navegação (para anterior())
+        self._em_transicao  = False            # evita duplo-avanço no autopass
+
+        # Duração em cache (carregada sob demanda)
+        self._duracao_cache: dict[str, float] = {}
+
+        # Estatísticas
         self.contagem: defaultdict[str, int] = defaultdict(int)
-        self.ultima_tocada = None
 
         pygame.mixer.music.set_volume(self.volume)
         self._carregar_estatisticas()
 
         if self.autoplay and self.musicas:
-            self.tocar()
+            self._tocar_interno()
 
     # ─────────────────────────────────────────
     # 📂 Carregamento
@@ -55,21 +69,97 @@ class MusicPlayer:
         if self.modo_shuffle:
             self._gerar_fila_shuffle()
 
+    def reiniciar_audio(self):
+        """
+        Reinicia o sistema de áudio (pygame.mixer).
+        Útil quando troca dispositivo de som (fone, caixa, etc).
+        """
+
+        try:
+            # salva estado atual
+            pos = self.posicao_seg()   # posição atual da música
+            vol = self.volume          # volume atual
+            tocando = self.esta_tocando()
+            pausado = self.esta_pausado()
+
+            # para tudo e fecha o mixer
+            pygame.mixer.music.stop()
+            pygame.mixer.quit()
+
+            # reinicia o mixer (padrão)
+            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+
+            # IMPORTANTE: precisa registrar de novo o evento de fim de música
+            pygame.mixer.music.set_endevent(_MUSIC_END)
+
+            # restaura volume
+            pygame.mixer.music.set_volume(vol)
+
+            # recarrega música atual
+            if self.musicas:
+                caminho = os.path.join(self.pasta, self.musicas[self.index])
+                pygame.mixer.music.load(caminho)
+                pygame.mixer.music.play()
+
+                # tenta voltar pra posição anterior
+                try:
+                    pygame.mixer.music.set_pos(pos)
+                except:
+                    pass
+
+                # restaura estado play/pause
+                if pausado:
+                    pygame.mixer.music.pause()
+                    self._pausado = True
+                    self._pos_pausada = pos
+                else:
+                    self._pausado = False
+                    self._inicio_toque = time.time()
+
+            print("🔊 Áudio reconectado com sucesso")
+
+        except Exception as e:
+            print(f"Erro ao reiniciar áudio: {e}")
+
     # ─────────────────────────────────────────
-    # ▶️ Controles
+    # ▶️ Controles internos (sem mexer no histórico de nav)
     # ─────────────────────────────────────────
-    def tocar(self):
+    def _tocar_interno(self):
+        """
+        Carrega e toca self.index.
+        NÃO toca no histórico de navegação — isso é responsabilidade
+        de proxima() / anterior() / tocar_indice().
+        """
         if not self.musicas:
             return False
         caminho = os.path.join(self.pasta, self.musicas[self.index])
-        pygame.mixer.music.load(caminho)
-        pygame.mixer.music.play()
-        self._inicio_toque = time.time()
-        self._pos_pausada  = 0.0
-        self._pausado      = False
-        self._registrar_reproducao(self.index)
-        print(f"▶️ {self.musicas[self.index]}")
+        try:
+            pygame.mixer.music.load(caminho)
+            pygame.mixer.music.play()
+        except Exception as e:
+            print(f"Erro ao tocar {caminho}: {e}")
+            return False
+
+        self._inicio_toque  = time.time()
+        self._pos_pausada   = 0.0
+        self._pausado       = False
+        self._em_transicao  = False
+
+        # Registra nas estatísticas de contagem
+        nome = self.musicas[self.index]
+        self.contagem[nome] += 1
+        if len(list(self.contagem)) > 0:
+            self._salvar_estatisticas()
+
+        print(f"▶️  [{self.index}] {self.musicas[self.index]}")
         return True
+
+    # ─────────────────────────────────────────
+    # 🎮 API pública de controle
+    # ─────────────────────────────────────────
+    def tocar(self):
+        """Toca a música no index atual (sem alterar histórico)."""
+        return self._tocar_interno()
 
     def pausar(self):
         if not self._pausado and pygame.mixer.music.get_busy():
@@ -84,44 +174,66 @@ class MusicPlayer:
             self._pausado = False
 
     def continuar(self):
-        """Toggle pause/retomar"""
+        """Toggle play/pause."""
         if self._pausado:
             self.retomar()
         elif pygame.mixer.music.get_busy():
             self.pausar()
         else:
-            self.tocar()
-
-    def esta_tocando(self) -> bool:
-        return pygame.mixer.music.get_busy() and not self._pausado
-
-    def esta_pausado(self) -> bool:
-        return self._pausado
+            self._tocar_interno()
 
     def proxima(self):
+        """Avança para próxima música, salvando a atual no histórico de nav."""
         if not self.musicas:
             return
-        self.index = self._proximo_shuffle() if self.modo_shuffle \
-                     else (self.index + 1) % len(self.musicas)
-        self.tocar()
+        # Salva posição atual para o anterior() poder voltar
+        self._historico_nav.append(self.index)
+        if len(self._historico_nav) > 200:
+            self._historico_nav = self._historico_nav[-200:]
+
+        if self.modo_shuffle:
+            self.index = self._proximo_shuffle()
+        else:
+            self.index = (self.index + 1) % len(self.musicas)
+        self._tocar_interno()
 
     def anterior(self):
+        """
+        Volta para a música anterior no histórico de navegação.
+        Se menos de 3s tocaram, volta para o início da atual primeiro.
+        Se não há histórico, vai para index-1.
+        """
         if not self.musicas:
             return
-        if len(self.historico) > 1:
-            self.historico.pop()
-            self.index = self.historico[-1]
+
+        pos_atual = self.posicao_seg()
+
+        # Se tocou mais de 3s: volta ao início da música atual
+        if pos_atual > 3.0:
+            self._pos_pausada  = 0.0
+            self._inicio_toque = time.time()
+            pygame.mixer.music.rewind()
+            return
+
+        # Senão: volta para a música anterior no histórico
+        if self._historico_nav:
+            self.index = self._historico_nav.pop()
         else:
+            # Sem histórico: vai para index-1
             self.index = (self.index - 1) % len(self.musicas)
-        self.tocar()
+
+        self._tocar_interno()
 
     def tocar_indice(self, indice: int):
         if 0 <= indice < len(self.musicas):
+            # Salva atual no histórico antes de pular
+            self._historico_nav.append(self.index)
+            if len(self._historico_nav) > 200:
+                self._historico_nav = self._historico_nav[-200:]
             self.index = indice
-            self.tocar()
+            self._tocar_interno()
 
     def seek(self, segundos: float):
-        """Pula para posição em segundos."""
         try:
             pygame.mixer.music.set_pos(segundos)
             self._pos_pausada  = segundos
@@ -130,10 +242,15 @@ class MusicPlayer:
             pass
 
     # ─────────────────────────────────────────
-    # ⏱️ Posição / Duração
+    # ⏱️ Estado / Posição / Fim de música
     # ─────────────────────────────────────────
+    def esta_tocando(self) -> bool:
+        return pygame.mixer.music.get_busy() and not self._pausado
+
+    def esta_pausado(self) -> bool:
+        return self._pausado
+
     def posicao_seg(self) -> float:
-        """Retorna posição atual em segundos."""
         if self._pausado:
             return self._pos_pausada
         if pygame.mixer.music.get_busy():
@@ -141,7 +258,6 @@ class MusicPlayer:
         return 0.0
 
     def duracao_seg(self) -> float:
-        """Duração da música atual em segundos (com cache)."""
         if not self.musicas:
             return 0.0
         nome = self.musicas[self.index]
@@ -149,7 +265,7 @@ class MusicPlayer:
             return self._duracao_cache[nome]
         try:
             sound = pygame.mixer.Sound(os.path.join(self.pasta, nome))
-            dur = sound.get_length()
+            dur   = sound.get_length()
             del sound
         except Exception:
             dur = 0.0
@@ -157,40 +273,42 @@ class MusicPlayer:
         return dur
 
     def progresso_pct(self) -> float:
-        """0.0 – 1.0"""
         dur = self.duracao_seg()
-        if dur <= 0:
-            return 0.0
-        return min(1.0, self.posicao_seg() / dur)
+        return min(1.0, self.posicao_seg() / dur) if dur > 0 else 0.0
 
-    def terminou(self) -> bool:
-        """True se a música acabou (não está tocando nem pausada)."""
-        return (not pygame.mixer.music.get_busy()) and (not self._pausado) \
-               and self._pos_pausada > 0
+    def checar_fim(self) -> bool:
+        """
+        Verifica se o evento de fim de música foi disparado pelo pygame.
+        Deve ser chamado periodicamente pelo loop da UI (no after()).
+        Retorna True UMA VEZ quando a música terminou — depois reseta.
+        Usa o sistema de eventos do pygame para detecção precisa.
+        """
+        if self._pausado or self._em_transicao:
+            return False
+        # Consome eventos pendentes do pygame sem bloquear
+        for event in pygame.event.get(_MUSIC_END):
+            if event.type == _MUSIC_END:
+                self._em_transicao = True   # bloqueia dupla-detecção
+                return True
+        return False
 
     # ─────────────────────────────────────────
     # 🏎️ Velocidade
     # ─────────────────────────────────────────
     def set_velocidade(self, v: float):
-        """
-        pygame não suporta pitch-shift nativo.
-        Implementamos via reinicialização do mixer com taxa de sample diferente.
-        v: 0.5 (metade) a 2.0 (dobro).
-        """
         v = max(0.5, min(2.0, round(v, 2)))
         self.velocidade = v
-        freq_base = 44100
-        nova_freq = int(freq_base * v)
+        nova_freq = int(44100 * v)
         pos = self.posicao_seg()
         pygame.mixer.music.stop()
         pygame.mixer.quit()
         pygame.mixer.init(frequency=nova_freq, size=-16, channels=2, buffer=2048)
+        pygame.mixer.music.set_endevent(_MUSIC_END)   # re-registra após reinit
         pygame.mixer.music.set_volume(self.volume)
         if self.musicas:
             caminho = os.path.join(self.pasta, self.musicas[self.index])
             pygame.mixer.music.load(caminho)
             pygame.mixer.music.play()
-            # Tenta continuar de onde parou
             try:
                 pygame.mixer.music.set_pos(pos)
             except Exception:
@@ -198,6 +316,7 @@ class MusicPlayer:
             self._inicio_toque = time.time()
             self._pos_pausada  = pos
             self._pausado      = False
+            self._em_transicao = False
 
     # ─────────────────────────────────────────
     # 🔀 Shuffle
@@ -215,15 +334,17 @@ class MusicPlayer:
         random.shuffle(indices)
         self.fila_shuffle = [self.index] + indices
 
-    def _proximo_shuffle(self):
+    def _proximo_shuffle(self) -> int:
         if not self.fila_shuffle:
             self._gerar_fila_shuffle()
-        pos = self.fila_shuffle.index(self.index) \
-              if self.index in self.fila_shuffle else -1
+        try:
+            pos = self.fila_shuffle.index(self.index)
+        except ValueError:
+            pos = -1
         return self.fila_shuffle[(pos + 1) % len(self.fila_shuffle)]
 
     # ─────────────────────────────────────────
-    # ⭐ Recomendações
+    # ⭐ Recomendações / Favoritas
     # ─────────────────────────────────────────
     def recomendadas(self, n=5):
         if not self.musicas:
@@ -253,17 +374,8 @@ class MusicPlayer:
                 if self.contagem.get(nome, 0) == 0]
 
     # ─────────────────────────────────────────
-    # 📊 Estatísticas
+    # 📊 Estatísticas / Config
     # ─────────────────────────────────────────
-    def _registrar_reproducao(self, i: int):
-        nome = self.musicas[i]
-        self.contagem[nome] += 1
-        self.historico.append(i)
-        if len(self.historico) > 100:
-            self.historico = self.historico[-100:]
-        self.ultima_tocada = i
-        self._salvar_estatisticas()
-
     def _salvar_estatisticas(self):
         try:
             dados = self._carregar_config()
@@ -301,7 +413,7 @@ class MusicPlayer:
             return {}
 
     # ─────────────────────────────────────────
-    # 🎚️ Volume
+    # 🎚️ Volume / Info
     # ─────────────────────────────────────────
     def set_volume(self, valor: float):
         self.volume = max(0.0, min(1.0, valor if valor <= 1 else valor / 1023))
@@ -310,9 +422,6 @@ class MusicPlayer:
     def get_volume_pct(self) -> int:
         return int(self.volume * 100)
 
-    # ─────────────────────────────────────────
-    # ℹ️ Info
-    # ─────────────────────────────────────────
     def musica_atual(self) -> str:
         if not self.musicas:
             return "Nenhuma música"
@@ -325,7 +434,6 @@ class MusicPlayer:
         return len(self.musicas)
 
     def destruir(self):
-        """Chama antes de fechar o app para liberar o mixer."""
         try:
             pygame.mixer.music.stop()
             pygame.mixer.quit()
