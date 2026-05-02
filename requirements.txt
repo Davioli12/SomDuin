@@ -6,4 +6,7 @@ time
 json
 os
 random
-
+subprocess
+pyautogui
+threading
+ctypes
