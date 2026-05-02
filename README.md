@@ -113,7 +113,7 @@ SomDuin/
 ## 1. Clone o projeto
 
 ```bash
-git clone https://github.com/seuusuario/SomDuin.git
+git clone https://github.com/davioli12/SomDuin.git
 cd SomDuin
 ```
 
